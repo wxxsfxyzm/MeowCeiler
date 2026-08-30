@@ -44,8 +44,12 @@ object ConstraintSetHelper {
     val applyTo by lazy {
         clzConstraintSetClass!!.findMethod { name("applyTo") }
     }
+    // HyperOS 3/4 均存在 clone 重载，只 Hook ConstraintLayout 参数版本。
     val clone by lazy {
-        clzConstraintSetClass!!.findMethod { name("clone") }
+        clzConstraintSetClass!!.methods.firstOrNull {
+            it.name == "clone" && it.parameterTypes.size == 1 &&
+                it.parameterTypes[0].name == "androidx.constraintlayout.widget.ConstraintLayout"
+        } ?: error("ConstraintSet.clone(ConstraintLayout) not found")
     }
 }
 

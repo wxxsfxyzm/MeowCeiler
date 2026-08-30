@@ -31,7 +31,12 @@ internal class PluginFactory(obj: Any) {
     }
 
     lateinit var pluginCtxRef: WeakReference<Context>
-    val mComponentName: Any? = com.sevtinge.hyperceiler.libhook.base.BaseHook.getObjectField(obj , "mComponentName")
+    // HyperOS 3 使用 mComponentName，HyperOS 4 改为 componentName。
+    val mComponentName: Any? = runCatching {
+        com.sevtinge.hyperceiler.libhook.base.BaseHook.getObjectField(obj, "mComponentName")
+    }.getOrElse {
+        com.sevtinge.hyperceiler.libhook.base.BaseHook.getObjectField(obj, "componentName")
+    }
 
     fun componentNames(type: Int, str: String): ComponentName {
         return when (type) {

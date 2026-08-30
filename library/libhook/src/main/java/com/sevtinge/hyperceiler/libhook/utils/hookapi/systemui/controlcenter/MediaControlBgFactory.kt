@@ -97,8 +97,19 @@ object MediaControlBgFactory : BaseHook() {
         ColorSchemeClass!!.findFieldOrNull("mAccent2")
             ?: ColorSchemeClass!!.findFieldOrNull("accent2")
     }
-    val enumStyleContent: Any? by lazy {
-        loadClass("com.android.systemui.monet.Style", lpparam.classLoader).findMethod { name("valueOf") }.invoke(null, "CONTENT")
+    // HyperOS 3 构造器接收 Style.CONTENT 枚举，HyperOS 4 改为对应的 Int 值 6。
+    private val contentStyleArgument by lazy {
+        val styleType = conColorScheme.parameterTypes.lastOrNull()
+            ?: return@lazy null
+        if (styleType == Int::class.javaPrimitiveType || styleType == Int::class.javaObjectType) {
+            6
+        } else {
+            runCatching {
+                styleType.enumConstants?.firstOrNull {
+                    (it as? Enum<*>)?.name == "CONTENT"
+                } ?: styleType.getField("CONTENT").get(null)
+            }.getOrNull()
+        }
     }
 
     private val metIconGetBitmap by lazy {
@@ -119,7 +130,6 @@ object MediaControlBgFactory : BaseHook() {
         fldColorSchemeNeutral2
         fldColorSchemeAccent1
         fldColorSchemeAccent2
-        enumStyleContent
         metIconGetBitmap
     }
 
@@ -129,9 +139,9 @@ object MediaControlBgFactory : BaseHook() {
     fun newColorScheme(wallpaperColors: WallpaperColors): Any? {
         return runCatching {
             if (conColorSchemeParamCount == 3) {
-                conColorScheme.newInstance(wallpaperColors, true, enumStyleContent)
+                conColorScheme.newInstance(wallpaperColors, true, contentStyleArgument)
             } else {
-                conColorScheme.newInstance(wallpaperColors, enumStyleContent)
+                conColorScheme.newInstance(wallpaperColors, contentStyleArgument)
             }
         }.getOrNull()
     }

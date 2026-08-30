@@ -38,10 +38,12 @@ import android.widget.ImageView
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.constraintlayout.widget.ConstraintSet
+import androidx.core.graphics.drawable.toBitmap
 import androidx.core.graphics.drawable.toDrawable
 import com.sevtinge.hyperceiler.common.log.XposedLog
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge
 import com.sevtinge.hyperceiler.libhook.base.BaseHook
+import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtilsKt.clearAllBlur
 import com.sevtinge.hyperceiler.libhook.utils.api.DeviceHelper.Miui.isPad
 import com.sevtinge.hyperceiler.libhook.utils.api.DeviceHelper.System.isMoreSmallVersion
 import com.sevtinge.hyperceiler.libhook.utils.api.HostExecutor
@@ -76,6 +78,8 @@ import com.sevtinge.hyperceiler.libhook.utils.hookapi.systemui.controlcenter.med
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.systemui.controlcenter.mediabg.RadialGradientProcessor
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.tool.getDimenByName
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.tool.getIdByName
+import io.github.lingqiqi5211.ezhooktool.core.callMethod
+import io.github.lingqiqi5211.ezhooktool.core.callStaticMethod
 import io.github.lingqiqi5211.ezhooktool.xposed.EzXposed.appContext
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.afterHookMethod
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.beforeHookMethod
@@ -87,10 +91,17 @@ import io.github.lingqiqi5211.ezhooktool.xposed.dsl.getObjectFieldOrNullAs
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.getValueByField
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.setAdditionalInstanceField
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.replaceHookMethod as replaceMethod
+import java.lang.ref.WeakReference
 
+/**
+ * HyperOS 3/4 通知中心及灵动岛/超级岛媒体卡片背景 Hook。
+ * HyperOS 4 的展开态材质视图额外通过插件 ClassLoader 安装 Hook。
+ */
 object CustomBackground : BaseHook() {
     private const val KEY_VIEW_HOLDER_WRAPPER = "KEY_VIEW_HOLDER_WRAPPER"
     private const val KEY_SEEKBAR_TINT_COLOR = "KEY_SEEKBAR_TINT_COLOR"
+    private const val KEY_DYNAMIC_ISLAND_MEDIA = "KEY_DYNAMIC_ISLAND_MEDIA"
+    private const val KEY_DYNAMIC_ISLAND_BG_RETRY = "KEY_DYNAMIC_ISLAND_BG_RETRY"
     const val KEY_REAL_PROGRESS_BAR = "KEY_REAL_PROGRESS_BAR"
     // background:
     // 0 -> Default;
@@ -111,19 +122,55 @@ object CustomBackground : BaseHook() {
     private val mediaBgViewId by lazy {
         appContext.getIdByName("media_bg_view")
     }
-    private val mediaBgRadiusDi by lazy {
-        appContext.getDimenByName("media_control_bg_radius")
-    }
-
     private var ncProcessor: BgProcessor? = null
     private var diProcessor: BgProcessor? = null
 
     private val ncPlayerConfig = PlayerConfig()
     private val diPlayerConfig = PlayerConfig()
     private val diPlayerConfigDummy = PlayerConfig()
+    private val hookedDynamicIslandMaterialClasses = mutableSetOf<Class<*>>()
+    @Volatile private var dynamicIslandMediaActive = false
+    @Volatile private var dynamicIslandExpandedViewRef: WeakReference<View>? = null
+
+    private fun ensureMediaBgClipping(mediaBg: View) {
+        if (!mediaBg.clipToOutline) {
+            mediaBg.clipToOutline = true
+            mediaBg.invalidateOutline()
+        }
+    }
+
+    private fun applyExpandedBackground(
+        holder: MiuiMediaViewHolderWrapper,
+        type: PlayerType,
+        processor: BgProcessor,
+        artwork: Drawable,
+        colorConfig: MediaViewColorConfig
+    ) {
+        if (type == PlayerType.NOTIFICATION_CENTER) return
+        var parent = holder.mediaBg.parent as? View
+        while (parent != null) {
+            if (parent.javaClass.name == "miui.systemui.dynamicisland.view.DynamicIslandExpandedView") {
+                val backgroundArtwork = artwork.constantState?.newDrawable()?.mutate() ?: artwork
+                findClassIfExists(
+                    "miui.systemui.util.MiBackgroundStyle",
+                    parent.context.classLoader
+                )?.runCatching {
+                    callStaticMethod("clearBionicsMaterial", parent)
+                }
+                runCatching { parent.clearAllBlur() }
+                parent.background = processor.createBackground(backgroundArtwork, colorConfig)
+                parent.invalidate()
+                return
+            }
+            parent = parent.parent as? View
+        }
+    }
 
     private val fldArtwork by lazy {
         mediaData?.findField("artwork")
+    }
+    private val fldAppIcon by lazy {
+        mediaData?.findField("appIcon")
     }
     private val fldPackageName by lazy {
         mediaData?.findField("packageName")
@@ -175,7 +222,7 @@ object CustomBackground : BaseHook() {
         }
     }
 
-    // ==================== OS3 通知中心 ====================
+    // ==================== HyperOS 3/4 通知中心 ====================
 
     private fun initNCForOS3() {
         val controllerClass = miuiMediaViewControllerImpl ?: return
@@ -205,13 +252,29 @@ object CustomBackground : BaseHook() {
         }
     }
 
-    // ==================== OS3 灵动岛 ====================
+    // ==================== HyperOS 3/4 灵动岛/超级岛 ====================
 
     private fun initDynamicIsland() {
+        findClassIfExists(
+            $$"com.android.systemui.shared.plugins.PluginInstance$PluginFactory"
+        )?.apply {
+            afterHookMethod("createClassLoader") { param ->
+                (param.result as? ClassLoader)?.let(::initDynamicIslandMaterial)
+            }
+            afterHookMethod("createPluginContext") { param ->
+                (param.result as? Context)?.classLoader?.let(::initDynamicIslandMaterial)
+            }
+        }
+
         miuiIslandMediaViewBinderImpl!!.apply {
+            replaceMethod("setMusicBgShader") { null }
             replaceMethod("updateForegroundColors") { null }
 
-            afterHookMethod("detach") { finiPlayerConfig(PlayerType.DYNAMIC_ISLAND) }
+            afterHookMethod("detach") {
+                dynamicIslandMediaActive = false
+                dynamicIslandExpandedViewRef = null
+                finiPlayerConfig(PlayerType.DYNAMIC_ISLAND)
+            }
 
             afterHookMethod("attach") { param ->
                 param.thisObject.getObjectFieldOrNull("holder")?.let { wrapViewHolder(it, true) }
@@ -219,22 +282,45 @@ object CustomBackground : BaseHook() {
             }
 
             afterHookMethod("bindMediaData") { param ->
+                val mediaData = param.args[0] ?: run {
+                    dynamicIslandMediaActive = false
+                    dynamicIslandExpandedViewRef = null
+                    finiPlayerConfig(PlayerType.DYNAMIC_ISLAND)
+                    return@afterHookMethod
+                }
+                dynamicIslandMediaActive = false
                 val context = param.thisObject.getObjectFieldOrNullAs<Context>("context")
                     ?: return@afterHookMethod
-                val mediaData = param.args[0] ?: return@afterHookMethod
-                val artwork = fldArtwork?.get(mediaData) as? Icon ?: return@afterHookMethod
+                val albumArtwork = fldArtwork?.get(mediaData) as? Icon
+                val appIcon = fldAppIcon?.get(mediaData) as? Icon
                 val packageName = fldPackageName?.get(mediaData) as? String ?: return@afterHookMethod
-                val holder = param.thisObject.getObjectFieldOrNull("holder")
-                    ?.let { wrapViewHolder(it, true) } ?: return@afterHookMethod
-                val dummyHolder = param.thisObject.getObjectFieldOrNull("dummyHolder")
-                    ?.let { wrapViewHolder(it, true) } ?: return@afterHookMethod
-                val isArtWorkUpdate = param.thisObject.getBooleanField("isArtWorkUpdate")
-                    || diPlayerConfig.currentPkgName != packageName
-
-                if (isArtWorkUpdate || !diPlayerConfig.isArtworkBound) {
-                    updateBackground(context, artwork, packageName, holder, PlayerType.DYNAMIC_ISLAND, diProcessor)
-                    updateBackground(context, artwork, packageName, dummyHolder, PlayerType.DUMMY_DYNAMIC_ISLAND, diProcessor)
+                val artwork = albumArtwork ?: appIcon ?: runCatching {
+                    Icon.createWithBitmap(
+                        context.packageManager.getApplicationIcon(packageName).toBitmap()
+                    )
+                }.getOrNull() ?: return@afterHookMethod
+                dynamicIslandMediaActive = true
+                val holder = param.thisObject.getObjectFieldOrNull("holder")?.let {
+                    runCatching { wrapViewHolder(it, true) }.onFailure { error ->
+                        XposedLog.e(TAG, lpparam.packageName, "Dynamic island holder wrap failed", error)
+                    }.getOrNull()
                 }
+                val dummyHolder = param.thisObject.getObjectFieldOrNull("dummyHolder")?.let {
+                    runCatching { wrapViewHolder(it, true) }.onFailure { error ->
+                        XposedLog.e(TAG, lpparam.packageName, "Dynamic island dummy holder wrap failed", error)
+                    }.getOrNull()
+                }
+                if (holder == null || dummyHolder == null) return@afterHookMethod
+                val binderArtwork = param.thisObject.getObjectFieldOrNullAs<Drawable>("artWorkDrawable")
+                val isArtworkUpdate = param.thisObject.getBooleanField("isArtWorkUpdate")
+                val isNewSongUpdate = param.thisObject.getBooleanField("isNewSongUpdate")
+                if (!isArtworkUpdate && !isNewSongUpdate && diPlayerConfig.isArtworkBound) return@afterHookMethod
+                updateDynamicIslandBackgroundWhenReady(
+                    context, artwork, packageName, holder, PlayerType.DYNAMIC_ISLAND, binderArtwork, 0
+                )
+                updateDynamicIslandBackgroundWhenReady(
+                    context, artwork, packageName, dummyHolder, PlayerType.DUMMY_DYNAMIC_ISLAND, binderArtwork, 0
+                )
 
                 val mediaBgTransYOffset = param.thisObject.getObjectFieldOrNullAs<Float>("mediaBgTransYOffset")
                 if (mediaBgTransYOffset != null && mediaBgTransYOffset != 0.0f) {
@@ -263,12 +349,154 @@ object CustomBackground : BaseHook() {
                 "pull_down_type_finish" -> {}
             }
         }
+
+        initDynamicIslandMaterial(lpparam.classLoader)
+    }
+
+    fun initDynamicIslandPlugin(classLoader: ClassLoader) {
+        initDynamicIslandMaterial(classLoader)
+    }
+
+    // HyperOS 4：展开态材质视图位于插件 ClassLoader；HyperOS 3 缺少目标类时安全跳过。
+    private fun initDynamicIslandMaterial(classLoader: ClassLoader) {
+        val contentViewClass = findClassIfExists(
+            "miui.systemui.dynamicisland.window.content.DynamicIslandBaseContentView",
+            classLoader
+        ) ?: return
+        synchronized(hookedDynamicIslandMaterialClasses) {
+            if (!hookedDynamicIslandMaterialClasses.add(contentViewClass)) return
+        }
+        val backgroundStyleClass = findClassIfExists("miui.systemui.util.MiBackgroundStyle", classLoader)
+
+        contentViewClass.afterHookMethod("updateBackgroundBg") { param ->
+            val currentData = param.thisObject.getObjectFieldOrNull("currentIslandData")
+            val extras = currentData?.callMethod("getExtras") as? Bundle
+            val markedMedia = dynamicIslandMediaActive ||
+                param.thisObject.getAdditionalInstanceFieldAs<Boolean>(KEY_DYNAMIC_ISLAND_MEDIA) == true
+            if (extras?.containsKey("miui.focus.pics") != true && !markedMedia) return@afterHookMethod
+
+            val view = param.args.firstOrNull() as? View ?: return@afterHookMethod
+            applyDynamicIslandBackground(param.thisObject, view, backgroundStyleClass)
+        }
+
+        contentViewClass.afterHookMethod($$"updateBackgroundBg$default") { param ->
+            val contentView = param.args.firstOrNull() ?: return@afterHookMethod
+            val view = param.args.getOrNull(1) as? View ?: return@afterHookMethod
+            applyDynamicIslandBackground(contentView, view, backgroundStyleClass)
+        }
+
+        listOf(
+            contentViewClass,
+            findClassIfExists("miui.systemui.dynamicisland.window.content.DynamicIslandContentView", classLoader),
+            findClassIfExists("miui.systemui.dynamicisland.window.content.DynamicIslandContentFakeView", classLoader)
+        ).forEach { clazz ->
+            clazz?.beforeHookMethod("updateExpandedView") { param ->
+                val data = param.args.firstOrNull() ?: return@beforeHookMethod
+                val extras = data.callMethod("getExtras") as? Bundle
+                if (extras?.containsKey("miui.focus.pics") == true) {
+                    param.thisObject.setAdditionalInstanceField(KEY_DYNAMIC_ISLAND_MEDIA, true)
+                }
+            }
+            clazz?.afterHookMethod("updateExpandedView") { param ->
+                applyDynamicIslandExpandedBackground(param.thisObject)
+            }
+        }
+
+        findClassIfExists(
+            "miui.systemui.dynamicisland.view.DynamicIslandExpandedView",
+            classLoader
+        )?.afterHookMethod($$"setContentView$miui_dynamicisland_release") { param ->
+            (param.thisObject as? View)?.let {
+                dynamicIslandExpandedViewRef = WeakReference(it)
+                applyDynamicIslandExpandedBackground(it)
+            }
+        }
+        XposedLog.d(TAG, lpparam.packageName, "Dynamic island media material hook installed")
+    }
+
+    private fun applyDynamicIslandBackground(
+        contentView: Any,
+        view: View,
+        backgroundStyleClass: Class<*>?
+    ) {
+        val currentData = contentView.getObjectFieldOrNull("currentIslandData")
+        val extras = currentData?.callMethod("getExtras") as? Bundle
+        val markedMedia = dynamicIslandMediaActive ||
+            contentView.getAdditionalInstanceFieldAs<Boolean>(KEY_DYNAMIC_ISLAND_MEDIA) == true
+        if (extras?.containsKey("miui.focus.pics") != true && !markedMedia) return
+        val playerConfig = if (contentView.javaClass.name.contains("DynamicIslandContentFakeView")) {
+            diPlayerConfigDummy
+        } else {
+            diPlayerConfig
+        }
+        val customBackground = playerConfig.artworkDrawable
+        if (customBackground == null) {
+            val retryCount = view.getAdditionalInstanceFieldAs<Int>(KEY_DYNAMIC_ISLAND_BG_RETRY) ?: 0
+            if (retryCount < 10) {
+                view.setAdditionalInstanceField(KEY_DYNAMIC_ISLAND_BG_RETRY, retryCount + 1)
+                view.postDelayed({
+                    applyDynamicIslandBackground(contentView, view, backgroundStyleClass)
+                }, 150L)
+            }
+            return
+        }
+        view.setAdditionalInstanceField(KEY_DYNAMIC_ISLAND_BG_RETRY, 0)
+        backgroundStyleClass?.runCatching {
+            callStaticMethod("clearBionicsMaterial", view)
+        }
+        runCatching { view.clearAllBlur() }
+        view.background = customBackground
+        view.invalidate()
+    }
+
+    private fun applyDynamicIslandExpandedBackground(contentView: Any) {
+        val expandedView = contentView.callMethod("getExpandedView") as? View
+            ?: runCatching { contentView.callMethod("getFakeExpandedView") as? View }.getOrNull()
+            ?: return
+        applyDynamicIslandExpandedBackground(expandedView)
+    }
+
+    private fun applyDynamicIslandExpandedBackground(expandedView: View) {
+        var parent: View? = expandedView
+        var isMedia = false
+        var isFake = false
+        while (parent != null) {
+            val currentData = parent.getObjectFieldOrNull("currentIslandData")
+            val extras = currentData?.callMethod("getExtras") as? Bundle
+            val markedMedia = dynamicIslandMediaActive ||
+                parent.getAdditionalInstanceFieldAs<Boolean>(KEY_DYNAMIC_ISLAND_MEDIA) == true
+            if (extras != null || markedMedia) {
+                isMedia = extras?.containsKey("miui.focus.pics") == true || markedMedia
+                isFake = parent.javaClass.name.contains("DynamicIslandContentFakeView")
+                break
+            }
+            parent = parent.parent as? View
+        }
+        if (!isMedia) return
+
+        val playerConfig = if (isFake) {
+            diPlayerConfigDummy
+        } else {
+            diPlayerConfig
+        }
+        playerConfig.artworkDrawable?.let {
+            findClassIfExists(
+                "miui.systemui.util.MiBackgroundStyle",
+                expandedView.context.classLoader
+            )?.runCatching {
+                callStaticMethod("clearBionicsMaterial", expandedView)
+            }
+            runCatching { expandedView.clearAllBlur() }
+            expandedView.background = it
+            expandedView.invalidate()
+        }
     }
 
     // ==================== ViewHolder 包装 ====================
 
     private fun wrapViewHolder(mMediaViewHolder: Any, isDynamicIsland: Boolean): MiuiMediaViewHolderWrapper? {
         mMediaViewHolder.getAdditionalInstanceFieldAs<MiuiMediaViewHolderWrapper>(KEY_VIEW_HOLDER_WRAPPER)?.let {
+            ensureMediaBgClipping(it.mediaBg)
             return it
         }
         val titleText = mMediaViewHolder.getMediaViewHolderFieldAs<TextView>("titleText", isDynamicIsland) ?: return null
@@ -297,14 +525,22 @@ object CustomBackground : BaseHook() {
                 val index: Int
                 if (mediaBgView != null) {
                     index = (parent.indexOfChild(mediaBgView) + 1).coerceIn(0, parent.childCount)
-                    it.outlineProvider = object : ViewOutlineProvider() {
-                        override fun getOutline(p0: View?, p1: Outline?) {
-                            if (p0 == null || p1 == null) return
-                            val cornerRadius = p0.context?.resources?.getDimension(mediaBgRadiusDi) ?: return
-                            p1.setRoundRect(0, 0, p0.width, p0.height, cornerRadius)
+                    val outlineProvider = mediaBgView.outlineProvider
+                    if (outlineProvider != null) {
+                        it.outlineProvider = outlineProvider
+                        it.clipToOutline = true
+                    } else {
+                        it.outlineProvider = object : ViewOutlineProvider() {
+                            override fun getOutline(p0: View?, p1: Outline?) {
+                                if (p0 == null || p1 == null) return
+                                val radiusId = p0.context.getDimenByName("media_control_bg_radius")
+                                if (radiusId == 0) return
+                                val cornerRadius = p0.context.resources.getDimension(radiusId)
+                                p1.setRoundRect(0, 0, p0.width, p0.height, cornerRadius)
+                            }
                         }
+                        it.clipToOutline = true
                     }
-                    it.clipToOutline = true
                 } else {
                     index = 0
                 }
@@ -321,6 +557,7 @@ object CustomBackground : BaseHook() {
             }
         } else {
             mediaBg = mMediaViewHolder.getMediaViewHolderFieldAs<ImageView>("mediaBg", false) ?: return null
+            ensureMediaBgClipping(mediaBg)
         }
 
         return MiuiMediaViewHolderWrapper(
@@ -388,9 +625,10 @@ object CustomBackground : BaseHook() {
         pkgName: String,
         holder: MiuiMediaViewHolderWrapper,
         type: PlayerType,
-        processor: BgProcessor?
+        processor: BgProcessor?,
+        artworkDrawableOverride: Drawable? = null
     ) {
-        val artworkLayer = artwork?.loadDrawable(context) ?: return
+        val artworkLayer = artworkDrawableOverride ?: artwork?.loadDrawable(context) ?: return
         val playerConfig = getPlayerConfig(type)
         val reqId = playerConfig.artworkNextBindRequestId++
 
@@ -459,7 +697,7 @@ object CustomBackground : BaseHook() {
             val colorConfig = pair.first
             val processedArtwork = pair.second
 
-            if (playerConfig.artworkDrawable == null) {
+            if (playerConfig.artworkDrawable == null || type != PlayerType.NOTIFICATION_CENTER) {
                 playerConfig.artworkDrawable = processor!!.createBackground(processedArtwork, colorConfig).apply {
                     setResizeAnim(type == PlayerType.NOTIFICATION_CENTER)
                 }
@@ -474,12 +712,46 @@ object CustomBackground : BaseHook() {
             }
 
             holder.mediaBg.setPadding(0, 0, 0, 0)
+            ensureMediaBgClipping(holder.mediaBg)
             holder.mediaBg.setImageDrawable(playerConfig.artworkDrawable)
+            applyExpandedBackground(holder, type, processor!!, processedArtwork, colorConfig)
+            if (type == PlayerType.DYNAMIC_ISLAND) {
+                dynamicIslandExpandedViewRef?.get()?.let(::applyDynamicIslandExpandedBackground)
+            }
 
-            val skipAnim = !holder.mediaBg.isShown
-            playerConfig.artworkDrawable?.updateAlbumCover(processedArtwork, colorConfig, skipAnim)
+            if (type == PlayerType.NOTIFICATION_CENTER) {
+                val skipAnim = !holder.mediaBg.isShown
+                playerConfig.artworkDrawable?.updateAlbumCover(processedArtwork, colorConfig, skipAnim)
+            }
             playerConfig.isArtworkBound = true
             XposedLog.d(TAG, lpparam.packageName, "updateBackground: applied pkg=$pkgName type=$type size=${width}x${height}")
+        }
+    }
+
+    private fun updateDynamicIslandBackgroundWhenReady(
+        context: Context,
+        artwork: Icon,
+        pkgName: String,
+        holder: MiuiMediaViewHolderWrapper,
+        type: PlayerType,
+        binderArtwork: Drawable?,
+        attempt: Int
+    ) {
+        val decodedArtwork = runCatching { artwork.loadDrawable(context) }.getOrNull()
+        if (decodedArtwork != null) {
+            updateBackground(context, artwork, pkgName, holder, type, diProcessor, decodedArtwork)
+            return
+        }
+        if (binderArtwork != null) {
+            updateBackground(context, artwork, pkgName, holder, type, diProcessor, binderArtwork)
+            return
+        }
+        if (attempt < 20) {
+            holder.albumView.postDelayed({
+                updateDynamicIslandBackgroundWhenReady(
+                    context, artwork, pkgName, holder, type, null, attempt + 1
+                )
+            }, 100L)
         }
     }
 }

@@ -39,6 +39,7 @@ import com.sevtinge.hyperceiler.libhook.rules.systemui.plugin.systemui.QsTileSup
 import com.sevtinge.hyperceiler.libhook.rules.systemui.plugin.systemui.StartCollpasedColumnPress
 import com.sevtinge.hyperceiler.libhook.rules.systemui.plugin.systemui.UnlockCarSicknessTile
 import com.sevtinge.hyperceiler.libhook.rules.systemui.plugin.systemui.VolumeOrQSBrightnessValue
+import com.sevtinge.hyperceiler.libhook.rules.systemui.controlcenter.media3.CustomBackground
 import com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.island.FocusNotifLyric
 import com.sevtinge.hyperceiler.libhook.utils.api.DeviceHelper.System.isMoreSmallVersion
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.PluginFactory
@@ -89,6 +90,8 @@ object NewPluginHelperKt : BaseHook() {
             return
         }
         val classLoader: ClassLoader = pluginCtx.classLoader
+        // HyperOS 4 超级岛材质视图由插件 ClassLoader 加载；HyperOS 3 查找不到目标类时安全跳过。
+        CustomBackground.initDynamicIslandPlugin(classLoader)
 
         when (componentName) {
             factory.componentNames(1, "miui.systemui.volume.VolumeDialogPlugin") -> {
